@@ -599,8 +599,9 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.43a';
+const APP_VERSION='v4.6.44';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
+/* v4.6.44 (4 Sep 2026): DAY NOTES OPEN TO EVERYONE, MOVED OUT OF THE JOB BLOB. Day notes were job.dayNotes[date] inside the job blob, gated to lead/admin. The ask was to open them to anyone, farmers included, the same as the whiteboard. Flipping the gate alone would have meant every phone in the shed writing a FULL JOB BLOB to record a one-line note - the identical write that lost a shearer's 200 head on 3 Sep and a wool handler's five runs on 25 Aug, moved from a couple of lead devices onto every handset on the worst connections in the fleet, while timed-out requests are still uncancelled. So notes now work the way the whiteboard already does: their own table (job_day_notes, natural key contractor_slug+job_id+note_date, RLS allow_all mirroring job_whiteboard), one small row per job per day, loaded with the tab, written debounced at 900ms, no blob involvement and no autosave. HARD PREREQUISITE: the job_day_notes table must exist BEFORE this file is deployed - it was created and the 39 existing notes across 8 contractors backfilled on 4 Sep. Blob dayNotes are still READ as a fallback so a job looks the same on a contractor still on an older build; they are no longer written, so the two stores cannot fight. CONCURRENT EDITS: several people can now hold the same box open. On write the row is re-read, and if it moved since we loaded it and the incoming text does not already contain theirs, the two are APPENDED rather than replaced. A messy note is recoverable; a wiped one is not. Last editor's role and time are shown under the box. NO pay calculation or report output is touched. */
 /* v4.6.43a (4 Sep 2026): CORRECTS TWO DEFECTS IN v4.6.43. (1) CREW GUARD RESTORED FOR SHED STAFF - v4.6.43 anchored the crew guard to rows from the shrink-guard query to avoid an extra request. That query filters kind='count' AND run_id<>'', which is how SHEARERS are stored; every wool handler, classer and presser is kind='shed_runs' with a blank run_id. 1,936 such rows across 164 crew fleet-wide, and 680 crew-job pairs (169 people) hold work with NO count rows at all. v4.6.43 would therefore have protected shearers while silently removing the protection for the wool handler the guard was written for on 25 Aug - a straight regression on the original fix, dressed as an improvement. The shrink-guard query is reverted to its original form and the crew guard now makes its own targeted request: crew with work on this job who are NOT already on the outgoing list. Normally zero rows, so it stays cheap on a bad link. Kinds limited to count/shed_runs/bales/bale_kg/cook_day - mess and travel are attendance attributes, the likeliest rows to survive a deliberate removal, and restoring on a stray mess row would re-apply a DEDUCTION to someone the lead meant to take off. (2) STALE-DEVICE RECOVERY - v4.6.43 made goOnline demote honestly on a cache fall-through, which was right, but autosave, flushNow AND the 20s background tally drain are all gated on isFreshRef. A demoted device therefore stops saving jobs and stops draining queued cells, and the only ways back were an 'online' event or a visibility change. On satellite or a hotspot the browser never reports offline, so it never reports online either: the device could sit stalled with a shed's cells held only in localStorage. The tick now retries a real load every third pass (~60s) while online and stale, and promotes on success. If the device is DIRTY it promotes WITHOUT replacing state, because overwriting unsaved local work with the server copy would be worse than the stall. */
 /* v4.6.43 (3 Sep 2026): CREW GUARD ANCHORED TO WORK + LOAD-PATH FIXES. Built on the v4.6.40 fleet master (cross-build hash verified identical across six contractors before edit). (1) CREW GUARD - the v4.6.30 version compared the outgoing crew list only against the SERVER's crew list, so it caught the second wipe and never the first: once any save had removed someone from the server copy, their tally rows became irrelevant because they could not enter `dropped`. A shearer with 200 head over four runs was invisible on a 12-person job on 3 Sep, board reading 892 against a true 1092. Now anyone with recorded work (value>0) on the job is merged back regardless of what the server lists. value>0 is deliberate: restoring on the mere existence of a row would make anyone holding a leftover zero-value cell permanently unremovable. The rows come from the existing shrink-guard query, widened to select crew_id and value, so this adds NO extra request per save. (2) SUNDRIES OFF THE SERIAL PATH - loadSundriesAll was awaited AFTER the jobs/farms/crew read, so on the largest contractor it queued behind everything and expired on its own 8s clock: 300 sundries_load_timeouts in 14 days on a contractor with ZERO sundries rows and a 96 kB table. Now started in parallel before the main await; deliberately not inside the Promise.all, so a sundries hang can never trip load_timeout and drop the whole load to cache. (3) goOnline NO LONGER LEAVES A CACHE LOAD FLAGGED FRESH - it pushed cached jobs into state and then only promoted on success, never demoted on failure, so a device that booted cleanly stayed 'fresh' all day through repeated failed reloads: no stale banner and save paths still armed, because they gate on isFreshRef. mountLoad and the visibility revalidate already demote; this path did not. This is the mechanism behind a stale device confidently overwriting good server data. (4) GUARD STAMPS REFRESHED AFTER A SUCCESSFUL SAVE, key-order-insensitive rates compare, and mob-rate trace logging - as shipped and harness-tested in v4.6.42. NO pay calculation, superable base, deduction, total or report output is touched. */
 /* v4.6.12a (26 Jul 2026): fleet-alignment rebuild - feature content identical to v4.6.12; new version string per one-build-one-version discipline. */
@@ -4380,7 +4381,82 @@ const flushMobDesc=(mid,v)=>{
     writeTallyCell({jobId:job.id,kind:'bale_kg',crewId:cid,date:viewDate,value:val});
   };
   const baleTot=id=>Object.values(job.baleTallies[id]||{}).reduce((a,b)=>a+b,0);
-  const setNote=v=>setJob(prev=>({...prev,dayNotes:{...prev.dayNotes,[viewDate]:v}}));
+  /* ══ v4.6.44 — DAY NOTES MOVED OUT OF THE JOB BLOB ═══════════════════════════
+     Day notes were job.dayNotes[date], inside the blob, gated to lead/admin.
+     Opening the gate without moving the storage would have meant every phone in
+     the shed writing a FULL JOB BLOB to make a one-line note — the exact write
+     that lost a shearer's 200 head and a wool handler's five runs, moved from a
+     couple of lead devices onto every handset on the worst connections we have.
+
+     So notes now work the way the whiteboard already does: their own table, one
+     small row per job per day, no blob involvement. Anyone with the tab open can
+     write one, farmers included.
+
+     Blob dayNotes are still READ as a fallback so nothing looks empty on a
+     contractor who has not taken this build yet; they are no longer written. */
+  const [noteMap,setNoteMap]=useState(null);        /* date -> {body,role,at} */
+  const [noteDraft,setNoteDraft]=useState(null);    /* uncontrolled-ish local echo */
+  const noteTimer=useRef(null);
+  const noteLoadedAt=useRef({});                    /* date -> updated_at we last saw */
+  useEffect(()=>{
+    let dead=false;
+    (async()=>{
+      try{
+        const r=await withTimeout(sb.from('job_day_notes')
+          .select('note_date,body,updated_by_role,updated_at')
+          .eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',job.id),
+          8000,'daynotes_load_timeout');
+        if(dead)return;
+        if(r&&!r.error&&Array.isArray(r.data)){
+          const m={};
+          r.data.forEach(row=>{m[row.note_date]={body:row.body||'',role:row.updated_by_role||'',at:row.updated_at};
+            noteLoadedAt.current[row.note_date]=row.updated_at;});
+          setNoteMap(m);
+        }else setNoteMap({});
+      }catch(e){ if(!dead)setNoteMap({}); }
+    })();
+    return()=>{dead=true;};
+  },[job.id]);
+  useEffect(()=>{setNoteDraft(null);},[viewDate]);
+  const noteRole=role==='farmer'?'Farmer':(role==='admin'?'Admin':(role==='shed_lead'?'Lead':'Crew'));
+  const noteServer=(noteMap&&noteMap[viewDate])||null;
+  const noteFallback=(job.dayNotes||{})[viewDate]||'';
+  const noteValue=noteDraft!==null?noteDraft:(noteServer?noteServer.body:noteFallback);
+  const pushNote=async(text)=>{
+    try{
+      /* NO SILENT LOSS. Several people can now hold this box open at once. If the
+         server row moved since we loaded it and the text is not ours, append
+         instead of replacing — a messy note is recoverable, a wiped one is not. */
+      let body=text;
+      const cur=await withTimeout(sb.from('job_day_notes')
+        .select('body,updated_at').eq('contractor_slug',CONTRACTOR_SLUG)
+        .eq('job_id',job.id).eq('note_date',viewDate).maybeSingle(),6000,'daynote_read_timeout');
+      if(cur&&!cur.error&&cur.data){
+        const seen=noteLoadedAt.current[viewDate];
+        if(seen&&cur.data.updated_at!==seen&&(cur.data.body||'')!==text){
+          const theirs=(cur.data.body||'').trim();
+          if(theirs&&text.indexOf(theirs)<0)body=theirs+'\n'+text;
+        }
+      }
+      const at=new Date().toISOString();
+      const w=await withTimeout(sb.from('job_day_notes').upsert({
+        contractor_slug:CONTRACTOR_SLUG,job_id:job.id,note_date:viewDate,
+        body:body,updated_by_role:noteRole,updated_at:at
+      },{onConflict:'contractor_slug,job_id,note_date'}),12000,'daynote_write_timeout');
+      if(w&&w.error)throw new Error(w.error.message);
+      noteLoadedAt.current[viewDate]=at;
+      setNoteMap(m=>({...(m||{}),[viewDate]:{body:body,role:noteRole,at:at}}));
+      if(body!==text)setNoteDraft(body);
+    }catch(e){
+      logSaveFailure(/timeout$/.test(e&&e.message||'')?'timeout':'error','daynote',
+        (e&&e.message)||'unknown');
+    }
+  };
+  const setNote=v=>{
+    setNoteDraft(v);
+    clearTimeout(noteTimer.current);
+    noteTimer.current=setTimeout(()=>pushNote(v),900);
+  };
   const setTravel=(cid,val)=>{
     setJob(prev=>({...prev,travelTallies:{...(prev.travelTallies||{}),[cid]:{...((prev.travelTallies||{})[cid]||{}),[viewDate]:val}}}));
     writeTallyCell({jobId:job.id,kind:'travel',crewId:cid,date:viewDate,value:val?1:0});
@@ -4740,7 +4816,20 @@ const flushMobDesc=(mid,v)=>{
         );
       })
     ),
-    e('div',{className:'notes-wrap'},e('div',{className:'notes-lbl'},'Notes — '+fmtDateLong(viewDate)),e('textarea',{className:'notes-ta',rows:3,placeholder:'Notes for the day...',value:(job.dayNotes||{})[viewDate]||'',disabled:!canEdit,onChange:ev=>setNote(ev.target.value)})),
+    e('div',{className:'notes-wrap'},
+      e('div',{className:'notes-lbl'},'Notes \u2014 '+fmtDateLong(viewDate)),
+      e('textarea',{className:'notes-ta',rows:3,
+        placeholder:noteMap===null?'Loading notes...':'Notes for the day \u2014 anyone can add',
+        value:noteValue,
+        /* v4.6.44 — no role gate, same as the whiteboard. Farmers included. */
+        onChange:ev=>setNote(ev.target.value)}),
+      noteServer&&noteServer.role&&noteServer.role!=='migrated'&&e('div',{
+        style:{fontSize:10,color:'var(--dim)',marginTop:3,textAlign:'right'}},
+        'Last edit: '+noteServer.role+(noteServer.at?' \u00b7 '+(()=>{
+          try{return new Date(noteServer.at).toLocaleTimeString([],{hour:'numeric',minute:'2-digit'});}
+          catch(e){return '';}
+        })():''))
+    ),
     e(BookPhotoPanel,{job,viewDate,role}), /* v4.6.11 */
     e('div',{style:{height:20}})
   );
