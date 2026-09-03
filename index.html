@@ -599,8 +599,9 @@ const LS_TALLY_QUEUE='mg_tally_queue_'+CONTRACTOR_SLUG; /* per-cell offline queu
 const LS_TALLY_DEAD='mg_tally_dead_'+CONTRACTOR_SLUG; /* v4.6.3g — quarantined cells (permanent rejection). Replayed once on boot in case the server-side blocker (e.g. missing kind constraint) was since fixed. */
 const LS_TALLY_META_QUEUE='mg_tally_meta_queue_'+CONTRACTOR_SLUG; /* v4.6.4 — offline/failed mob metadata (type/desc) updates to existing count cells; flushed alongside the tally queue. */
 const ROLE_TIMEOUT_HOURS=12; /* auto-reset after 12h inactivity */
-const APP_VERSION='v4.6.43';
+const APP_VERSION='v4.6.43a';
 const SUPER_RATE=0.12; /* SG rate, 12% from 1 Jul 2025. One-line change if legislated rate moves. */
+/* v4.6.43a (4 Sep 2026): CORRECTS TWO DEFECTS IN v4.6.43. (1) CREW GUARD RESTORED FOR SHED STAFF - v4.6.43 anchored the crew guard to rows from the shrink-guard query to avoid an extra request. That query filters kind='count' AND run_id<>'', which is how SHEARERS are stored; every wool handler, classer and presser is kind='shed_runs' with a blank run_id. 1,936 such rows across 164 crew fleet-wide, and 680 crew-job pairs (169 people) hold work with NO count rows at all. v4.6.43 would therefore have protected shearers while silently removing the protection for the wool handler the guard was written for on 25 Aug - a straight regression on the original fix, dressed as an improvement. The shrink-guard query is reverted to its original form and the crew guard now makes its own targeted request: crew with work on this job who are NOT already on the outgoing list. Normally zero rows, so it stays cheap on a bad link. Kinds limited to count/shed_runs/bales/bale_kg/cook_day - mess and travel are attendance attributes, the likeliest rows to survive a deliberate removal, and restoring on a stray mess row would re-apply a DEDUCTION to someone the lead meant to take off. (2) STALE-DEVICE RECOVERY - v4.6.43 made goOnline demote honestly on a cache fall-through, which was right, but autosave, flushNow AND the 20s background tally drain are all gated on isFreshRef. A demoted device therefore stops saving jobs and stops draining queued cells, and the only ways back were an 'online' event or a visibility change. On satellite or a hotspot the browser never reports offline, so it never reports online either: the device could sit stalled with a shed's cells held only in localStorage. The tick now retries a real load every third pass (~60s) while online and stale, and promotes on success. If the device is DIRTY it promotes WITHOUT replacing state, because overwriting unsaved local work with the server copy would be worse than the stall. */
 /* v4.6.43 (3 Sep 2026): CREW GUARD ANCHORED TO WORK + LOAD-PATH FIXES. Built on the v4.6.40 fleet master (cross-build hash verified identical across six contractors before edit). (1) CREW GUARD - the v4.6.30 version compared the outgoing crew list only against the SERVER's crew list, so it caught the second wipe and never the first: once any save had removed someone from the server copy, their tally rows became irrelevant because they could not enter `dropped`. A shearer with 200 head over four runs was invisible on a 12-person job on 3 Sep, board reading 892 against a true 1092. Now anyone with recorded work (value>0) on the job is merged back regardless of what the server lists. value>0 is deliberate: restoring on the mere existence of a row would make anyone holding a leftover zero-value cell permanently unremovable. The rows come from the existing shrink-guard query, widened to select crew_id and value, so this adds NO extra request per save. (2) SUNDRIES OFF THE SERIAL PATH - loadSundriesAll was awaited AFTER the jobs/farms/crew read, so on the largest contractor it queued behind everything and expired on its own 8s clock: 300 sundries_load_timeouts in 14 days on a contractor with ZERO sundries rows and a 96 kB table. Now started in parallel before the main await; deliberately not inside the Promise.all, so a sundries hang can never trip load_timeout and drop the whole load to cache. (3) goOnline NO LONGER LEAVES A CACHE LOAD FLAGGED FRESH - it pushed cached jobs into state and then only promoted on success, never demoted on failure, so a device that booted cleanly stayed 'fresh' all day through repeated failed reloads: no stale banner and save paths still armed, because they gate on isFreshRef. mountLoad and the visibility revalidate already demote; this path did not. This is the mechanism behind a stale device confidently overwriting good server data. (4) GUARD STAMPS REFRESHED AFTER A SUCCESSFUL SAVE, key-order-insensitive rates compare, and mob-rate trace logging - as shipped and harness-tested in v4.6.42. NO pay calculation, superable base, deduction, total or report output is touched. */
 /* v4.6.12a (26 Jul 2026): fleet-alignment rebuild - feature content identical to v4.6.12; new version string per one-build-one-version discipline. */
 /* v4.6.12 (20 Jul 2026): PER-CREW PIN, contractor-controlled (design settled with the founder before any deploy; an earlier worker-self-set draft was discarded - self-set has a bootstrap race where an imposter claims a name first and sets its PIN). MODEL: every worker is AUTO-ASSIGNED a random 4-digit PIN (genCrewPin at creation; existing crew backfilled via SQL per contractor at rollout). The PIN is stored READABLE at crew_members.data.pin and shown on the worker's card in My Database (admin-only surface) with a regenerate button and a 'Text PIN' button (plain GSM-7 SMS via /api/send-sms so the worker has it on file). DELIBERATE ENGINEERING CALL, not an oversight: with the shared anon key and a 4-digit space, a hash is brute-forced in under a second by anyone determined, so hashing here is theatre; readable storage buys contractor look-up-ability at no real security cost. This is a visibility gate against casual wrong-name claims - real authentication is v5 (Supabase Auth + RLS). CLAIM FLOW: picking a name with a PIN demands it (CrewPinVerifyModal, direct compare, works offline once the record is synced; names with PINs show a lock in the picker); 'Not you?' re-challenges; app_settings.requireCrewPin=true blocks claiming names with NO pin ('ask your contractor') for hard-lockdown contractors, off = pinless names bind as before. Workers never set or change their own PIN; contractor regenerates on request (specific chosen PINs = SRD via SQL). Lead/Admin PINs and the per-job PIN untouched. */
@@ -1605,10 +1606,6 @@ async function dbSaveJob(job){
      bug pattern that wiped a live job — without a timeout
      the await never returns, the catch block never fires, and the data
      never makes it to the queue. */
-  /* v4.6.43 — rows from the shrink-guard query, reused by the crew guard below.
-     null means the query failed; the crew guard then restores nobody, which is
-     the same fail-open behaviour as before — a guard must never block a save. */
-  let tallyGuardRows=null;
   try{
     /* v4.6.3 — Save-time guard against shrinking runs.
        Before writing jobs.data to Supabase, check tally_entries for the
@@ -1622,14 +1619,9 @@ async function dbSaveJob(job){
        Wed and Thu cells orphaned in tally_entries with no run structure
        to display them under. */
     try{
-      /* v4.6.43 — also selects crew_id and value so the crew guard below can be
-         anchored to recorded work without a second round trip. The largest
-         contractor's devices are already timing out on the requests they make;
-         adding one per save would have made the very problem this build exists
-         to fix worse. */
       const tallyRunIdsResult=await withTimeout(
         sb.from('tally_entries')
-          .select('run_id,crew_id,value')
+          .select('run_id')
           .eq('contractor_slug',CONTRACTOR_SLUG)
           .eq('job_id',job.id)
           .eq('kind','count')
@@ -1637,9 +1629,6 @@ async function dbSaveJob(job){
         3000,
         'guard_runids_timeout'
       ).catch(err=>({error:{message:'guard_runids_failed:'+err.message}}));
-      if(tallyRunIdsResult&&!tallyRunIdsResult.error&&Array.isArray(tallyRunIdsResult.data)){
-        tallyGuardRows=tallyRunIdsResult.data;
-      }
       if(tallyRunIdsResult&&!tallyRunIdsResult.error&&Array.isArray(tallyRunIdsResult.data)){
         const tallyRunIds=new Set(tallyRunIdsResult.data.map(r=>r.run_id).filter(Boolean));
         if(tallyRunIds.size>0){
@@ -1723,9 +1712,36 @@ async function dbSaveJob(job){
              unremovable — a live complaint on another contractor. Zero work,
              removable as normal. */
           const outCrew=Array.isArray(jobForBlob.crew)?jobForBlob.crew.slice():[];
-          const withWork=[...new Set(
-            (tallyGuardRows||[]).filter(r=>r&&r.crew_id&&Number(r.value)>0).map(r=>r.crew_id)
-          )];
+          /* v4.6.43a — ask the server ONLY for crew who hold work on this job and
+             are NOT already on the outgoing list. Normally that is zero rows, so
+             this is cheap on the wire even on a bad link.
+
+             v4.6.43 tried to avoid the round trip by reusing the shrink-guard
+             query. That query filters kind='count' AND run_id<>'', which is how
+             SHEARERS are stored. Every wool handler, classer and presser is
+             kind='shed_runs' with a blank run_id — 1,936 rows across 164 people
+             fleet-wide, none of them visible to that filter. It would have
+             protected shearers and silently dropped the protection for the wool
+             handler this guard was built for on 25 Aug. Correctness first: take
+             the extra request.
+
+             Kinds are limited to actual WORK. mess and travel are attendance
+             attributes and are the likeliest rows to be left behind after a
+             deliberate removal; restoring on those would resurrect someone the
+             lead meant to take off, and a stray mess row would re-apply a
+             DEDUCTION to them. */
+          let crewOrphans=null;
+          try{
+            let cq=sb.from('tally_entries').select('crew_id')
+              .eq('contractor_slug',CONTRACTOR_SLUG).eq('job_id',job.id)
+              .in('kind',['count','shed_runs','bales','bale_kg','cook_day'])
+              .gt('value',0).limit(50);
+            if(outCrew.length>0)cq=cq.not('crew_id','in','('+outCrew.join(',')+')');
+            const cr2=await withTimeout(cq,3000,'guard_crew_timeout')
+              .catch(err=>({error:{message:'guard_crew_failed:'+err.message}}));
+            if(cr2&&!cr2.error&&Array.isArray(cr2.data))crewOrphans=cr2.data;
+          }catch(cErr){ /* fail open — a guard must never block a save */ }
+          const withWork=[...new Set((crewOrphans||[]).map(r=>r&&r.crew_id).filter(Boolean))];
           const restore=withWork.filter(cid=>outCrew.indexOf(cid)<0);
           if(restore.length>0){
             restore.forEach(cid=>outCrew.push(cid));
@@ -8205,8 +8221,46 @@ function App(){
      self-healing without user action. */
   useEffect(()=>{
     let running=false; /* v4.6.3g — re-entrancy guard: never let a slow flush overlap the next tick */
+    let staleTries=0;
     const tick=async()=>{
       if(running)return;
+      /* v4.6.43a — STALE RECOVERY. Everything below (and autosave, and flushNow)
+         is gated on isFreshRef, so a device demoted to stale stops saving jobs
+         AND stops draining the tally queue. Before v4.6.43 nothing demoted on
+         this path so the trap did not exist; now that goOnline demotes honestly,
+         a device needs a way back that does not depend on the user happening to
+         background and reopen the app. On satellite or a hotspot the browser
+         never fires 'offline', so it never fires 'online' either, and that was
+         the only other way out. Retry a real load every third tick (~60s) while
+         online and stale, and promote if it comes back from the server. */
+      if(navigator.onLine&&!isFreshRef.current&&isLoaded.current){
+        staleTries++;
+        if(staleTries%3===0){
+          running=true;
+          try{
+            const r=await dbLoad();
+            if(r&&!r.fromCache){
+              if(dirtyRef.current){
+                /* Local edits made while saves were blocked. Do NOT replace state
+                   with the server copy — that would destroy a shed's work, which
+                   is worse than the stall this is fixing. Promote only, so the
+                   local changes save up through the guards on the next pass. */
+                setFresh(true,'stale_recovery_dirty');
+                logSaveFailure('diag_load','stale_recovery','promoted_dirty;ticks='+staleTries);
+              }else{
+                syncLookups(r.farms,r.crew);
+                suppressNextSaveRef.current=true;
+                setJobs(r.jobs.map(j=>migrateJobRoles(j,r.crew)));
+                setFarmList(r.farms);setCrewList(r.crew);
+                setFresh(true,'stale_recovery');
+                logSaveFailure('diag_load','stale_recovery','recovered_clean;ticks='+staleTries);
+              }
+            }
+          }catch(e){}finally{running=false;}
+        }
+        return;
+      }
+      staleTries=0;
       if(!navigator.onLine||!isFreshRef.current)return;
       /* Only drain the per-CELL tally queue here. The whole-job queue (LS_QUEUE)
          pushes a stripped job BLOB, and a background push of a stale blob is the
